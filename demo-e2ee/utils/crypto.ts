@@ -1,60 +1,147 @@
 import * as Crypto from 'expo-crypto';
+import { secp256k1 } from '@noble/curves/secp256k1';
+import { Buffer } from 'buffer/';
 
 export interface KeyPair {
-  privateKey: string;
-  publicKey: string;
+  privateKey: Uint8Array;
+  publicKey: Uint8Array;
 }
 
-// Generate a random key pair (simplified for demo)
+export interface EncryptedData {
+  content: string;
+  iv: string;
+}
+
+/**
+ * Generate ECDH key pair using secp256k1 curve
+ */
 export async function generateKeyPair(): Promise<KeyPair> {
-  const randomBytes = await Crypto.getRandomBytesAsync(32);
-  const keyString = Array.from(randomBytes)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-  
+  // Generate 32-byte private key
+  const privateKey = await Crypto.getRandomBytesAsync(32);
+
+  // Derive public key from private key
+  const publicKey = secp256k1.getPublicKey(privateKey);
+
   return {
-    privateKey: keyString,
-    publicKey: keyString, // In a real app, use different keys
+    privateKey: new Uint8Array(privateKey),
+    publicKey: new Uint8Array(publicKey),
   };
 }
 
-// Simple XOR encryption for demo purposes
-export async function encryptMessage(message: string, key: string): Promise<{ encrypted: string; iv: string }> {
-  const iv = await Crypto.getRandomBytesAsync(16);
-  const ivString = Array.from(iv)
-    .map(b => b.toString(16).padStart(2, '0'))
-    .join('');
-  
-  let encrypted = '';
-  for (let i = 0; i < message.length; i++) {
-    const charCode = message.charCodeAt(i);
-    const keyCode = key.charCodeAt(i % key.length);
-    encrypted += String.fromCharCode(charCode ^ keyCode);
-  }
-  
-  const base64Encrypted = btoa(encrypted);
-  
-  return {
-    encrypted: base64Encrypted,
-    iv: ivString,
-  };
+/**
+ * Calculate shared secret using ECDH
+ * Both parties will get the same shared secret
+ */
+export function calculateSharedSecret(
+  myPrivateKey: Uint8Array,
+  theirPublicKey: Uint8Array
+): Uint8Array {
+  const sharedSecret = secp256k1.getSharedSecret(myPrivateKey, theirPublicKey);
+  // Remove the first byte (0x04 prefix for uncompressed public key)
+  return new Uint8Array(sharedSecret.slice(1));
 }
 
-// Simple XOR decryption for demo purposes
-export function decryptMessage(encryptedMessage: string, key: string, iv: string): string {
+/**
+ * AES-256-CTR Encryption using Web Crypto API
+ */
+export async function encryptMessage(
+  message: string,
+  sharedSecret: Uint8Array
+): Promise<EncryptedData> {
   try {
-    const encrypted = atob(encryptedMessage);
-    let decrypted = '';
-    
-    for (let i = 0; i < encrypted.length; i++) {
-      const charCode = encrypted.charCodeAt(i);
-      const keyCode = key.charCodeAt(i % key.length);
-      decrypted += String.fromCharCode(charCode ^ keyCode);
-    }
-    
-    return decrypted;
+    // Generate random IV (16 bytes)
+    const iv = await Crypto.getRandomBytesAsync(16);
+
+    // Convert message to Uint8Array
+    const encoder = new TextEncoder();
+    const messageBytes = encoder.encode(message);
+
+    // Import shared secret as CryptoKey
+    const key = await crypto.subtle.importKey(
+      'raw',
+      sharedSecret.slice(0, 32), // Use first 32 bytes for AES-256
+      { name: 'AES-CTR' },
+      false,
+      ['encrypt']
+    );
+
+    // Encrypt
+    const encryptedBuffer = await crypto.subtle.encrypt(
+      {
+        name: 'AES-CTR',
+        counter: new Uint8Array(iv),
+        length: 128,
+      },
+      key,
+      messageBytes
+    );
+
+    // Convert to base64
+    const encryptedArray = new Uint8Array(encryptedBuffer);
+    const content = Buffer.from(encryptedArray).toString('base64');
+    const ivString = Buffer.from(iv).toString('base64');
+
+    return {
+      content,
+      iv: ivString,
+    };
+  } catch (error) {
+    console.error('Encryption error:', error);
+    throw new Error('Failed to encrypt message');
+  }
+}
+
+/**
+ * AES-256-CTR Decryption using Web Crypto API
+ */
+export async function decryptMessage(
+  encryptedData: EncryptedData,
+  sharedSecret: Uint8Array
+): Promise<string> {
+  try {
+    // Decode base64
+    const encryptedBytes = Buffer.from(encryptedData.content, 'base64');
+    const iv = Buffer.from(encryptedData.iv, 'base64');
+
+    // Import shared secret as CryptoKey
+    const key = await crypto.subtle.importKey(
+      'raw',
+      sharedSecret.slice(0, 32), // Use first 32 bytes for AES-256
+      { name: 'AES-CTR' },
+      false,
+      ['decrypt']
+    );
+
+    // Decrypt
+    const decryptedBuffer = await crypto.subtle.decrypt(
+      {
+        name: 'AES-CTR',
+        counter: new Uint8Array(iv),
+        length: 128,
+      },
+      key,
+      encryptedBytes
+    );
+
+    // Convert to string
+    const decoder = new TextDecoder();
+    return decoder.decode(decryptedBuffer);
   } catch (error) {
     console.error('Decryption error:', error);
     return '[Decryption failed]';
   }
+}
+
+/**
+ * Helper to convert Uint8Array to hex string
+ */
+export function toHex(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString('hex');
+}
+
+/**
+ * Helper to convert hex string to Uint8Array
+ */
+export function fromHex(hex: string): Uint8Array {
+  return new Uint8Array(Buffer.from(hex, 'hex'));
 }

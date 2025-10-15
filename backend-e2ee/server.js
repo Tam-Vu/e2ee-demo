@@ -10,9 +10,9 @@ app.use(express.json());
 const server = http.createServer(app);
 const io = socketIo(server, {
   cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  }
+    origin: '*',
+    methods: ['GET', 'POST'],
+  },
 });
 
 const users = new Map();
@@ -21,26 +21,94 @@ io.on('connection', (socket) => {
   console.log('New client connected:', socket.id);
 
   socket.on('register', ({ username, publicKey, isMonitor }) => {
-    users.set(socket.id, { username, publicKey, socketId: socket.id, isMonitor: isMonitor || false });
+    users.set(socket.id, {
+      username,
+      publicKey,
+      socketId: socket.id,
+      isMonitor: isMonitor || false,
+    });
     io.emit('users', Array.from(users.values()));
-    console.log(`User registered: ${username}${isMonitor ? ' (MONITOR MODE - Hacker)' : ''}`);
+    console.log(
+      `User registered: ${username}${
+        isMonitor ? ' (MONITOR MODE - Hacker)' : ''
+      }`
+    );
+  });
+
+  socket.on('exchange-key', ({ to, publicKey }) => {
+    const fromUser = users.get(socket.id);
+    const toUser = users.get(to);
+
+    console.log(
+      `Key exchange request: ${fromUser?.username} → ${toUser?.username}`
+    );
+    io.to(to).emit('exchange-key', {
+      from: socket.id,
+      fromUsername: fromUser?.username,
+      publicKey,
+      timestamp: Date.now(),
+    });
+
+    users.forEach((user, socketId) => {
+      if (user.isMonitor && socketId !== socket.id && socketId !== to) {
+        io.to(socketId).emit('intercepted', {
+          from: socket.id,
+          to: to,
+          fromUsername: fromUser?.username,
+          toUsername: toUser?.username,
+          encryptedMessage: publicKey,
+          iv: '',
+          timestamp: Date.now(),
+          note: 'KEY EXCHANGE - Public key intercepted (useless without private key)',
+        });
+      }
+    });
+  });
+
+  socket.on('exchange-key-back', ({ to, publicKey }) => {
+    const fromUser = users.get(socket.id);
+    const toUser = users.get(to);
+
+    console.log(
+      `Key exchange response: ${fromUser?.username} → ${toUser?.username}`
+    );
+
+    io.to(to).emit('exchange-key-back', {
+      from: socket.id,
+      fromUsername: fromUser?.username,
+      publicKey,
+      timestamp: Date.now(),
+    });
+
+    users.forEach((user, socketId) => {
+      if (user.isMonitor && socketId !== socket.id && socketId !== to) {
+        io.to(socketId).emit('intercepted', {
+          from: socket.id,
+          to: to,
+          fromUsername: fromUser?.username,
+          toUsername: toUser?.username,
+          encryptedMessage: publicKey,
+          iv: '',
+          timestamp: Date.now(),
+          note: 'KEY EXCHANGE RESPONSE - Public key intercepted (useless without private key)',
+        });
+      }
+    });
   });
 
   socket.on('message', ({ to, encryptedMessage, iv }) => {
     const fromUser = users.get(socket.id);
     const toUser = users.get(to);
-    
-    // Send to recipient
+
     io.to(to).emit('message', {
       from: socket.id,
       fromUsername: fromUser?.username,
       toUsername: toUser?.username,
       encryptedMessage,
       iv,
-      timestamp: Date.now()
+      timestamp: Date.now(),
     });
 
-    // Broadcast to all monitors (hackers) - they see encrypted data
     users.forEach((user, socketId) => {
       if (user.isMonitor && socketId !== socket.id) {
         io.to(socketId).emit('intercepted', {
@@ -51,12 +119,14 @@ io.on('connection', (socket) => {
           encryptedMessage,
           iv,
           timestamp: Date.now(),
-          note: '🔒 INTERCEPTED - Cannot decrypt without private key'
+          note: 'MESSAGE INTERCEPTED - Encrypted with shared secret (cannot decrypt)',
         });
       }
     });
 
-    console.log(`Message from ${fromUser?.username} to ${toUser?.username} (Encrypted)`);
+    console.log(
+      `Message from ${fromUser?.username} to ${toUser?.username} (Encrypted)`
+    );
   });
 
   socket.on('disconnect', () => {
@@ -71,5 +141,5 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}`);
 });

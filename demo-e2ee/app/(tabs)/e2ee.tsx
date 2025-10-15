@@ -11,16 +11,25 @@ import {
 } from 'react-native';
 import { ThemedText } from '@/components/themed-text';
 import { ThemedView } from '@/components/themed-view';
-import io, { Socket } from 'socket.io-client';
-import { generateKeyPair, encryptMessage, decryptMessage, KeyPair } from '@/utils/crypto';
+import { io, Socket } from 'socket.io-client';
+import {
+  generateKeyPair,
+  encryptMessage,
+  decryptMessage,
+  calculateSharedSecret,
+  toHex,
+  fromHex,
+  KeyPair,
+} from '@/utils/crypto';
 
-const SERVER_URL = 'http://192.168.2.37:3000';
+const SERVER_URL = 'http://localhost:3000';
 
 interface User {
   username: string;
   publicKey: string;
   socketId: string;
   isMonitor?: boolean;
+  sharedSecret?: Uint8Array; // Store calculated shared secret
 }
 
 interface Message {
@@ -45,9 +54,9 @@ export default function E2EEChatScreen() {
   const [message, setMessage] = useState('');
   const [messages, setMessages] = useState<Message[]>([]);
   const [myKeys, setMyKeys] = useState<KeyPair | null>(null);
-  
-  // Use ref to avoid closure issues with socket event handlers
+
   const myKeysRef = useRef<KeyPair | null>(null);
+  const sharedSecretsRef = useRef<Map<string, Uint8Array>>(new Map());
 
   useEffect(() => {
     myKeysRef.current = myKeys;
@@ -70,59 +79,163 @@ export default function E2EEChatScreen() {
       setMyKeys(keys);
 
       const newSocket = io(SERVER_URL);
+      console.log('Generated key pair');
 
       newSocket.on('connect', () => {
         newSocket.emit('register', {
           username: username.trim(),
-          publicKey: keys.publicKey,
+          publicKey: toHex(keys.publicKey),
           isMonitor: isMonitorMode,
         });
         setIsRegistered(true);
       });
 
       newSocket.on('users', (userList: User[]) => {
-        setUsers(userList.filter((u) => u.socketId !== newSocket.id && !u.isMonitor));
+        setUsers(
+          userList.filter((u) => u.socketId !== newSocket.id && !u.isMonitor)
+        );
       });
 
-      newSocket.on('message', async ({ from, fromUsername, encryptedMessage, iv, timestamp }) => {
+      newSocket.on('exchange-key', ({ from, fromUsername, publicKey }) => {
+        console.log('Received key exchange from:', fromUsername);
         const keys = myKeysRef.current;
         if (keys) {
-          const decrypted = decryptMessage(encryptedMessage, keys.privateKey, iv);
-          console.log('Received message:', { from, fromUsername, decrypted });
+          // Emit Shared Secret Key
+          const theirPublicKey = fromHex(publicKey);
+          const sharedSecret = calculateSharedSecret(
+            keys.privateKey,
+            theirPublicKey
+          );
+          sharedSecretsRef.current.set(from, sharedSecret);
+          setUsers((prev) =>
+            prev.map((u) => (u.socketId === from ? { ...u, sharedSecret } : u))
+          );
+          newSocket.emit('exchange-key-back', {
+            to: from,
+            publicKey: toHex(keys.publicKey),
+          });
+          console.log('Shared secret established with:', fromUsername);
+        }
+      });
+
+      newSocket.on('exchange-key-back', ({ from, fromUsername, publicKey }) => {
+        console.log('Received key exchange response from:', fromUsername);
+        const keys = myKeysRef.current;
+        if (keys) {
+          const theirPublicKey = fromHex(publicKey);
+          // Receive Shared Secret Key
+          const sharedSecret = calculateSharedSecret(
+            keys.privateKey,
+            theirPublicKey
+          );
+          sharedSecretsRef.current.set(from, sharedSecret);
+          setUsers((prev) =>
+            prev.map((u) => (u.socketId === from ? { ...u, sharedSecret } : u))
+          );
+          setSelectedUser((prev) => {
+            if (prev && prev.socketId === from) {
+              return { ...prev, sharedSecret };
+            }
+            return prev;
+          });
+          console.log('Shared secret established with:', fromUsername);
+        }
+      });
+
+      newSocket.on(
+        'message',
+        async ({ from, fromUsername, encryptedMessage, iv, timestamp }) => {
+          console.log('Received encrypted message from:', fromUsername, {
+            from,
+            hasEncryptedMessage: !!encryptedMessage,
+            hasIv: !!iv,
+          });
+
+          const keys = myKeysRef.current;
+          if (keys) {
+            const sharedSecret = sharedSecretsRef.current.get(from);
+
+            if (sharedSecret) {
+              try {
+                const encryptedData = {
+                  content: encryptedMessage,
+                  iv: iv,
+                };
+                const decrypted = await decryptMessage(
+                  encryptedData,
+                  sharedSecret
+                );
+                console.log('Decrypted message:', decrypted);
+
+                setMessages((prev) => [
+                  ...prev,
+                  {
+                    id: Date.now().toString() + Math.random(),
+                    text: decrypted,
+                    from,
+                    fromUsername,
+                    timestamp,
+                    isMe: false,
+                  },
+                ]);
+              } catch (error) {
+                console.error('Decryption failed:', error);
+                Alert.alert('Error', 'Failed to decrypt message');
+              }
+            } else {
+              console.log(
+                'No shared secret available for user:',
+                fromUsername,
+                from
+              );
+              Alert.alert(
+                'Key Exchange Required',
+                'Requesting secure connection...'
+              );
+
+              newSocket.emit('exchange-key', {
+                to: from,
+                publicKey: toHex(keys.publicKey),
+              });
+            }
+          } else {
+            console.log('No keys available to decrypt message');
+          }
+        }
+      );
+
+      newSocket.on(
+        'intercepted',
+        ({
+          fromUsername,
+          toUsername,
+          encryptedMessage,
+          iv,
+          timestamp,
+          note,
+        }) => {
+          console.log('Intercepted message:', {
+            fromUsername,
+            toUsername,
+            encryptedMessage: encryptedMessage.substring(0, 50) + '...',
+            iv,
+          });
           setMessages((prev) => [
             ...prev,
             {
               id: Date.now().toString() + Math.random(),
-              text: decrypted,
-              from,
+              text: note,
+              from: 'intercepted',
               fromUsername,
+              toUsername,
               timestamp,
               isMe: false,
+              isIntercepted: true,
+              encryptedData: encryptedMessage,
             },
           ]);
-        } else {
-          console.log('No keys available to decrypt message');
         }
-      });
-
-      // Hacker/Monitor mode - intercept messages
-      newSocket.on('intercepted', ({ fromUsername, toUsername, encryptedMessage, iv, timestamp, note }) => {
-        console.log('Intercepted message:', { fromUsername, toUsername, encryptedMessage, iv });
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: Date.now().toString() + Math.random(),
-            text: note,
-            from: 'intercepted',
-            fromUsername,
-            toUsername,
-            timestamp,
-            isMe: false,
-            isIntercepted: true,
-            encryptedData: encryptedMessage, // Show full encrypted message
-          },
-        ]);
-      });
+      );
 
       newSocket.on('connect_error', () => {
         Alert.alert('Connection Error', 'Could not connect to server');
@@ -130,6 +243,7 @@ export default function E2EEChatScreen() {
 
       setSocket(newSocket);
     } catch (error) {
+      console.error('Registration error:', error);
       Alert.alert('Error', 'Failed to register');
     }
   };
@@ -137,18 +251,31 @@ export default function E2EEChatScreen() {
   const sendMessage = async () => {
     if (!message.trim() || !selectedUser || !myKeys || !socket) return;
 
-    try {
-      const { encrypted, iv } = await encryptMessage(message.trim(), selectedUser.publicKey);
+    const sharedSecret = sharedSecretsRef.current.get(selectedUser.socketId);
 
-      console.log('Sending message:', { 
-        to: selectedUser.socketId, 
-        toUsername: selectedUser.username,
-        originalMessage: message.trim() 
+    if (!sharedSecret) {
+      Alert.alert(
+        'Establishing Connection',
+        'Setting up secure channel...\nPlease wait a moment and try again.'
+      );
+      socket.emit('exchange-key', {
+        to: selectedUser.socketId,
+        publicKey: toHex(myKeys.publicKey),
       });
+      return;
+    }
+
+    try {
+      const { content, iv } = await encryptMessage(
+        message.trim(),
+        sharedSecret
+      );
+
+      console.log('Sending encrypted message to:', selectedUser.username);
 
       socket.emit('message', {
         to: selectedUser.socketId,
-        encryptedMessage: encrypted,
+        encryptedMessage: content,
         iv,
       });
 
@@ -164,8 +291,8 @@ export default function E2EEChatScreen() {
       ]);
 
       setMessage('');
-    } catch (error) {
-      console.error('Send message error:', error);
+    } catch (err) {
+      console.error('❌ Send message error:', err);
       Alert.alert('Error', 'Failed to send message');
     }
   };
@@ -177,7 +304,9 @@ export default function E2EEChatScreen() {
           E2EE Chat Demo
         </ThemedText>
         <ThemedText style={styles.subtitle}>
-          {isMonitorMode ? '🔍 Monitor Mode - See encrypted traffic' : 'Enter your username to start'}
+          {isMonitorMode
+            ? 'Monitor Mode - See encrypted traffic'
+            : 'Enter your username to start'}
         </ThemedText>
         <TextInput
           style={styles.input}
@@ -186,16 +315,19 @@ export default function E2EEChatScreen() {
           value={username}
           onChangeText={setUsername}
         />
-        <TouchableOpacity 
-          style={[styles.monitorToggle, isMonitorMode && styles.monitorToggleActive]} 
+        <TouchableOpacity
+          style={[
+            styles.monitorToggle,
+            isMonitorMode && styles.monitorToggleActive,
+          ]}
           onPress={() => setIsMonitorMode(!isMonitorMode)}
         >
           <ThemedText style={styles.monitorToggleText}>
             {isMonitorMode ? '🔓 Monitor Mode (Hacker)' : '🔒 Normal User'}
           </ThemedText>
           <ThemedText style={styles.monitorHint}>
-            {isMonitorMode 
-              ? 'You will see encrypted messages but cannot decrypt them' 
+            {isMonitorMode
+              ? 'You will see encrypted messages but cannot decrypt them'
               : 'Tap to enable monitor/hacker mode'}
           </ThemedText>
         </TouchableOpacity>
@@ -206,7 +338,6 @@ export default function E2EEChatScreen() {
     );
   }
 
-  // Monitor/Hacker mode - just show intercepted messages
   if (isMonitorMode) {
     return (
       <KeyboardAvoidingView
@@ -214,12 +345,15 @@ export default function E2EEChatScreen() {
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
       >
         <ThemedView style={styles.header}>
-          <ThemedText type="subtitle">🔍 Monitor Mode - Intercepting Traffic</ThemedText>
+          <ThemedText type="subtitle">
+            Monitor Mode - Intercepting Traffic
+          </ThemedText>
         </ThemedView>
-        
+
         <ThemedView style={styles.statsContainer}>
           <ThemedText style={styles.statsText}>
-            📊 Intercepted: {messages.length} message{messages.length !== 1 ? 's' : ''}
+            Intercepted: {messages.length} message
+            {messages.length !== 1 ? 's' : ''}
           </ThemedText>
         </ThemedView>
 
@@ -229,27 +363,31 @@ export default function E2EEChatScreen() {
           renderItem={({ item }) => (
             <View style={styles.interceptedContainer}>
               <ThemedText style={styles.interceptedHeader}>
-                📡 {item.fromUsername} → {item.toUsername}
+                {item.fromUsername} → {item.toUsername}
               </ThemedText>
               <ThemedText style={styles.interceptedTime}>
                 {new Date(item.timestamp).toLocaleTimeString()}
               </ThemedText>
               <View style={styles.encryptedDataContainer}>
-                <ThemedText style={styles.interceptedLabel}>Encrypted Message (Full):</ThemedText>
+                <ThemedText style={styles.interceptedLabel}>
+                  Encrypted Message (Full):
+                </ThemedText>
                 <View style={styles.scrollableEncrypted}>
                   <ThemedText style={styles.interceptedEncrypted} selectable>
                     {item.encryptedData}
                   </ThemedText>
                 </View>
               </View>
-              <ThemedText style={styles.interceptedNote}>{item.text}</ThemedText>
+              <ThemedText style={styles.interceptedNote}>
+                {item.text}
+              </ThemedText>
             </View>
           )}
           contentContainerStyle={styles.messagesList}
           ListEmptyComponent={
             <View style={styles.emptyContainer}>
               <ThemedText style={styles.emptyText}>
-                👀 Waiting to intercept messages...
+                Waiting to intercept messages...
               </ThemedText>
               <ThemedText style={styles.emptySubtext}>
                 All encrypted traffic between users will appear here
@@ -298,7 +436,9 @@ export default function E2EEChatScreen() {
         <TouchableOpacity onPress={() => setSelectedUser(null)}>
           <ThemedText style={styles.backButton}>← Back</ThemedText>
         </TouchableOpacity>
-        <ThemedText style={styles.chatUsername}>{selectedUser?.username || 'Chat'}</ThemedText>
+        <ThemedText style={styles.chatUsername}>
+          {selectedUser?.username || 'Chat'}
+        </ThemedText>
       </ThemedView>
 
       <FlatList
@@ -311,10 +451,12 @@ export default function E2EEChatScreen() {
               item.isMe ? styles.myMessage : styles.theirMessage,
             ]}
           >
-            <ThemedText style={[
-              styles.messageText,
-              item.isMe ? styles.myMessageText : styles.theirMessageText
-            ]}>
+            <ThemedText
+              style={[
+                styles.messageText,
+                item.isMe ? styles.myMessageText : styles.theirMessageText,
+              ]}
+            >
               {item.text}
             </ThemedText>
           </View>

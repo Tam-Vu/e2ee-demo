@@ -38,7 +38,8 @@
     "react-native-web": "~0.21.0",
     "socket.io-client": "^4.6.1",
     "expo-crypto": "~14.0.1",
-    "react-native-get-random-values": "^1.11.0"
+    "react-native-get-random-values": "^1.11.0",
+    "@noble/curves": "^1.6.0"
   },
   "devDependencies": {
     "@types/react": "~19.1.0",
